@@ -1,0 +1,191 @@
+#include <NewPing.h>
+#include <MPU6050_tockn.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Arduino.h>
+
+NewPing sonar(12, 13, 200);  // 12, 13, 200
+MPU6050 imu(Wire);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+class Nano : public Nano {
+private:
+  int left, right;
+
+public:
+  void setSpeed(int speed) {
+    left = speed;
+    right = speed;
+  }
+
+  void ahead(float speed) {
+    speed = throttle.getPow(speed);
+    Nano::ahead(speed);
+  }
+
+  void steer(int angle) {
+    int maxSpeed = max(left, right);
+    angle = constrain(angle, 25, 155);
+
+    if (angle > 90) {
+      left = throttle.getPow(maxSpeed);
+      right = throttle.getPow(maxSpeed * sin(angle * M_PI / 180));
+    } else {
+      left = throttle.getPow(maxSpeed * sin(angle * M_PI / 180));
+      right = throttle.getPow(maxSpeed);
+    }
+
+    set(left, right, angle);
+  }
+};
+struct SensorValue {
+  int pin, angle, weight, min, max, on;
+  void setMinMax() {
+    int cur = analogRead(pin);
+    if (cur < min && cur > 0) min = cur;
+    if (cur > max) max = cur;
+  }
+  void setWeight() {
+    weight = angle * (max - analogRead(pin) + min) / (max - min);
+    on = max - analogRead(pin) + min;
+  }
+};
+
+#define cap 10
+
+class LineTracker {
+private:
+  unsigned int prev = 90,
+               timer,
+               threshold = 9999;
+
+  float kP = 0.65, kI = 0.1 / cap, kD = 0.25;
+
+  int angle = 90,
+      prevGyro,
+      speed = 5,
+      error[cap],
+      tail = 0;
+  //int sum = 0;
+
+  SensorValue sensor[6] = {
+    { 0, 2000, 0, 3500, 0, 0 },
+    { 0, 1905, 0, 3500, 0, 0 },
+    { 0, 1995, 0, 3500, 0, 0 },
+    { 0, 2005, 0, 3500, 0, 0 },
+    { 0, 2045, 0, 3500, 0, 0 },
+    { 0, 2065, 0, 3500, 0, 0 }
+  };
+
+  void regulateMovement() {
+    imu.update();
+    if (millis() - timer > 100) {
+      if ((angle < 50 || angle > 130) && (int)imu.getAngleZ() == prevGyro) {
+        speed++;
+      } else {
+        speed = 5;
+      }
+      // Serial.println((String)speed + " " imu.getAngleZ() + " " + prevGyro);
+      prevGyro = imu.getAngleZ();
+      timer = millis();
+    }
+    nano.setSpeed(speed);
+  }
+
+  void findAngle() {
+    int count=0;
+    angle=0;
+    for (int i=0;i<6;i++) {
+      angle+=sensor[i].weight;
+      count+=sensor[i].on;
+    }
+    if (count < threshold) {
+      if (prev<85) {  //85
+        angle=35;
+      } else if (prev>95) {  //95
+        angle=165;
+      } else {
+        angle=100;
+      }
+    } else {
+      angle=90+(kP*angle+kI*sum()+kD*(angle-error[tail-1<0?cap:tail]));
+    }
+    prev=angle;
+  }
+
+  int sum() {
+    int sum = 0;
+    error[++tail %= cap] = angle;
+    for (int i = 0; i < cap; i++) {
+      sum += error[i];
+    }
+    return sum;
+  }
+
+  void update() {
+    for (int i = 0; i < 6; i++) {
+      sensor[i].setWeight();
+      // Serial.print((String)" " + sensor[i].weight + " ");
+    }
+    // Serial.println();
+  }
+
+public:
+  LineTracker() {
+    for (int i = 0; i < 6; i++) {
+      pinMode(sensor[i].pin, INPUT);
+    }
+
+    imu.update();
+    prevGyro = imu.getAngleZ();
+  }
+
+  void begin() {
+    for (int i = 0; i < 6; i++) {
+      sensor[i].min = EEPROM.readInt(29 * sizeof(float) + i * sizeof(int));
+      Serial.println(sensor[i].min);
+    }
+    for (int i = 0; i < 6; i++) {
+      sensor[i].max = EEPROM.readInt(29 * sizeof(float) + (6 + i) * sizeof(int));
+      Serial.println(sensor[i].max);
+    }
+    threshold = EEPROM.readInt(29 * sizeof(float) + 12 * sizeof(int));
+  }
+
+  void setPID(float p, float i, float d) {
+    kP = p;
+    kI = i;
+    kD = d;
+  }
+
+  void setthreshold() {
+    timer = millis();
+    while (millis() - timer < 10000) {
+      for (int i = 0; i < 6; i++) {
+        sensor[i].setMinMax();
+      }
+    }
+    for (int i = 0; i < 6; i++) {
+      EEPROM.writeInt(29 * sizeof(float) + i * sizeof(int), sensor[i].min);
+      Serial.println(sensor[i].min);
+    }
+    for (int i = 0; i < 6; i++) {
+      EEPROM.writeInt(29 * sizeof(float) + (6 + i) * sizeof(int), sensor[i].max);
+      if (sensor[i].max < threshold) threshold = sensor[i].max;
+      Serial.println(sensor[i].max);
+    }
+    EEPROM.writeInt(29 * sizeof(float) + 12 * sizeof(int), threshold);
+    EEPROM.commit();
+  }
+
+  void follow() {
+    update();
+    findAngle();
+    regulateMovement();
+    nano.steer(angle);
+  }
+};
+LineTracker tracker;
